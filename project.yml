@@ -1,0 +1,44 @@
+name: ContourConnect
+
+options:
+  bundleIdPrefix: ch.yaakov
+  deploymentTarget:
+    iOS: "16.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  ContourConnect:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ch.yaakov.contourconnect
+        TARGETED_DEVICE_FAMILY: "1"
+        INFOPLIST_FILE: Info.plist
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: Contour Test
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSBluetoothAlwaysUsageDescription: "Used to talk to the Contour+2 camera."
+        # Guesses for the camera's accessory protocol string.
+        # iOS may only show the camera to apps that declare its real string,
+        # so we list the most plausible candidates. Replace once the real one is known.
+        UISupportedExternalAccessoryProtocols:
+          - com.contour.protocol
+          - com.contour.connect
+          - com.contour.camera
+          - com.contour.contourconnect
+          - com.contour.viewfinder
+          - com.contourcam.protocol
+    dependencies:
+      - sdk: ExternalAccessory.framework
