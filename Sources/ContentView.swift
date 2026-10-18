@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var hexInput = ""
     @State private var shareURL: URL?
     @State private var showDebug = false
+    @State private var showSettings = false
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -70,6 +71,13 @@ struct ContentView: View {
                              : "Waiting for camera status …")
                             .foregroundStyle(.secondary)
                     }
+                    if let st = monitor.settings, let s = monitor.status {
+                        let p = st[Int(s.switchPosition) == 2 ? 2 : 1]
+                        let mode = ContourSettings.videoModes(pal: p.videoFormat == 0).first { $0.0 == p.videoRes }?.1 ?? "mode \(p.videoRes)"
+                        LabeledContent("Mode", value: mode)
+                    }
+                    Button("Camera settings …") { showSettings = true }
+                        .disabled(monitor.sessionProtocol == nil)
                     if let fw = monitor.firmware {
                         LabeledContent("Version bytes", value: fw)
                     }
@@ -110,6 +118,9 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Contour")
+            .sheet(isPresented: $showSettings) {
+                SettingsView().environmentObject(monitor)
+            }
             .refreshable { monitor.refresh() }
             // iOS closes the accessory session when the app goes to the background; reconnect on return.
             .onChange(of: scenePhase) { phase in

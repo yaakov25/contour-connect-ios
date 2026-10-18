@@ -16,6 +16,8 @@ switch position) and record start/stop all work on a Contour+2 with firmware 2.1
   `0x75` get status → `0x76`, `0x90`/`0x91` record start/stop → `0x92`/`0x93`.
 - Status payload (19 B, big endian): HDOP, battery %, capacity MB (u32), free MB (u32),
   state (u32: 0 paused, 1 preview, 2 recording, 3 stopped), seconds (u32), switch position.
+- Settings: `0x55` → `0x58` (95 B), written with `0x57` (105 B, Android layout, zero padded),
+  then `0x5A` apply → `0x5B` (0 = applying, 1 = done). Layout documented in `ContourSettings.swift`.
 
 ## Build
 

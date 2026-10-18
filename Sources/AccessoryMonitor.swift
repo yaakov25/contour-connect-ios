@@ -13,6 +13,8 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
     @Published var firmware: String?
     @Published var status: ContourProtocol.Status?
     @Published var previewRunning = false
+    @Published var settings: ContourSettings?
+    @Published var settingsMessage: String?
 
     // Viewfinder
     @Published var latestFrame: UIImage?
@@ -122,6 +124,7 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         rxBuffer.removeAll()
         status = nil
         firmware = nil
+        settings = nil
         verbosePackets = true
         for stream in [newSession.inputStream as Stream?, newSession.outputStream as Stream?].compactMap({ $0 }) {
             stream.delegate = self
@@ -169,6 +172,25 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
     }
 
     func startRecording() { sendCommand(.recordStart) }
+
+    /// Writes the full settings block (CMD 0x57), then asks the camera to apply it (CMD 0x5A),
+    /// the same two steps the Android app uses.
+    func saveSettings(_ newSettings: ContourSettings) {
+        guard session != nil else { settingsMessage = "Camera not connected"; return }
+        guard status?.isRecording != true else { settingsMessage = "Stop recording first"; return }
+        settingsMessage = "Sending …"
+        sendCommand(.setSettings, data: newSettings.encoded())
+        settings = newSettings
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.sendCommand(.setConfigure)
+        }
+        // If the camera never confirms, re-read the settings so the screen shows what it really has.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            guard let self = self, self.settingsMessage == "Sending …" else { return }
+            self.settingsMessage = "No confirmation from camera, re-reading settings"
+            self.requestSettings()
+        }
+    }
     func stopRecording() { sendCommand(.recordStop) }
     func requestStatus(log: Bool = false) { sendCommand(.getStatus, quiet: !log) }
     func requestSettings() { sendCommand(.getSettings) }
@@ -313,9 +335,28 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
             append("Recording stopped")
             requestStatus()
         case .retSettings:
-            append("Settings received (\(packet.data.count) B)")
+            if let s = ContourSettings(data: packet.data) {
+                settings = s
+                append("Settings received (\(packet.data.count) B), camera model \(s.model), version \(s.version)")
+            } else {
+                append("Settings received but too short (\(packet.data.count) B)")
+            }
         case .retConfigure:
-            append("Configure state: \(packet.data.first.map(String.init) ?? "?")")
+            let state = packet.data.first ?? 0
+            append("Configure state: \(state)")
+            if state == 1 {
+                // Same as Android: camera finished applying; refresh everything and restart preview.
+                settingsMessage = "Saved to camera"
+                startStatusTimer()
+                requestStatus()
+                requestSettings()
+                startPreview()
+            } else {
+                // Camera is applying settings; pause polling like the Android app.
+                statusTimer?.invalidate()
+                statusTimer = nil
+                settingsMessage = "Camera is applying settings …"
+            }
         case .debugText:
             append("Camera debug: \(String(decoding: packet.data, as: UTF8.self))")
         default:
