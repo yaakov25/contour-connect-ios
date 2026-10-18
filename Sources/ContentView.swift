@@ -5,10 +5,32 @@ import UIKit
 struct ContentView: View {
     @EnvironmentObject var monitor: AccessoryMonitor
     @State private var hexInput = ""
+    @State private var shareURL: URL?
 
     var body: some View {
         NavigationStack {
             List {
+                Section("Viewfinder") {
+                    if let frame = monitor.latestFrame {
+                        Image(uiImage: frame)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        Text("No image yet. Any JPEG frame the camera sends will appear here.")
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("Received: \(monitor.rxTotalBytes) B · frames: \(monitor.frameCount)")
+                        .font(.system(.footnote, design: .monospaced))
+                    if monitor.rxTotalBytes > 0 {
+                        Button("Prepare raw data for sharing") { shareURL = monitor.exportRawCapture() }
+                    }
+                    if let url = shareURL {
+                        ShareLink("Share contour-rx.bin", item: url)
+                    }
+                    Button("Reset capture", role: .destructive) { monitor.resetCapture() }
+                }
+
                 Section("Accessories visible to this app") {
                     if monitor.accessories.isEmpty {
                         Text("None. Make sure the camera shows “Connected” in Settings › Bluetooth, then tap Refresh.")
@@ -55,7 +77,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("Contour Test")
+            .navigationTitle("Contour")
             .refreshable { monitor.refresh() }
         }
     }

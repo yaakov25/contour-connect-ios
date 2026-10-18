@@ -1,5 +1,6 @@
 import Foundation
 import ExternalAccessory
+import UIKit
 
 /// Watches for MFi (iAP) accessories, shows what iOS reports about them,
 /// and can open a raw data session so we can probe the camera's protocol.
@@ -8,8 +9,18 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
     @Published var log: [String] = []
     @Published var sessionProtocol: String?
 
+    // Viewfinder: any JPEG found in the incoming byte stream is shown here.
+    @Published var latestFrame: UIImage?
+    @Published var frameCount = 0
+    @Published var rxTotalBytes = 0
+
     private var session: EASession?
     private var pendingOutput = Data()
+    private var frameBuffer = Data()
+    /// Everything received in this app run, for export (capped).
+    private(set) var rawCapture = Data()
+    private let rawCaptureLimit = 20 * 1024 * 1024
+    private var rxLogLines = 0
 
     let declaredProtocols: [String] =
         Bundle.main.object(forInfoDictionaryKey: "UISupportedExternalAccessoryProtocols") as? [String] ?? []
@@ -33,6 +44,12 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         append("Scan: \(accessories.count) accessory(ies) visible to this app")
         for accessory in accessories {
             append(describe(accessory))
+        }
+        // Open a session automatically so we never miss data the camera sends on its own.
+        if session == nil,
+           let camera = accessories.first(where: { !$0.protocolStrings.isEmpty }),
+           let proto = camera.protocolStrings.first {
+            openSession(accessory: camera, protocolString: proto)
         }
     }
 
@@ -148,11 +165,11 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
             append("Stream open (\(aStream is InputStream ? "in" : "out"))")
         case .hasBytesAvailable:
             guard let input = aStream as? InputStream else { return }
-            var buffer = [UInt8](repeating: 0, count: 1024)
+            var buffer = [UInt8](repeating: 0, count: 4096)
             while input.hasBytesAvailable {
                 let count = input.read(&buffer, maxLength: buffer.count)
                 if count <= 0 { break }
-                append("RX \(count) B: \(hex(Data(buffer[0..<count])))")
+                handleReceived(Data(buffer[0..<count]))
             }
         case .hasSpaceAvailable:
             flushOutput()
@@ -164,6 +181,82 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         default:
             break
         }
+    }
+
+    // MARK: - Received data
+
+    private func handleReceived(_ chunk: Data) {
+        rxTotalBytes += chunk.count
+        if rawCapture.count + chunk.count <= rawCaptureLimit {
+            rawCapture.append(chunk)
+        }
+        // Log the first 200 chunks in full detail (truncated to 64 bytes), then summarise,
+        // so a video stream doesn't flood the log.
+        rxLogLines += 1
+        if rxLogLines <= 200 {
+            let shown = chunk.prefix(64)
+            let more = chunk.count > 64 ? " …" : ""
+            append("RX \(chunk.count) B: \(hex(shown))\(more)")
+        } else if rxLogLines % 100 == 0 {
+            append("RX total so far: \(rxTotalBytes) B, frames: \(frameCount)")
+        }
+        extractJPEGFrames(from: chunk)
+    }
+
+    /// Looks for JPEG start (FF D8) and end (FF D9) markers and shows each complete image.
+    private func extractJPEGFrames(from chunk: Data) {
+        frameBuffer.append(chunk)
+        let soi = Data([0xFF, 0xD8])
+        let eoi = Data([0xFF, 0xD9])
+        while true {
+            guard let start = frameBuffer.range(of: soi) else {
+                // Keep only a trailing 0xFF in case a marker is split across chunks.
+                if let last = frameBuffer.last, last == 0xFF {
+                    frameBuffer = Data([0xFF])
+                } else {
+                    frameBuffer.removeAll()
+                }
+                return
+            }
+            guard let end = frameBuffer.range(of: eoi, in: start.upperBound..<frameBuffer.endIndex) else {
+                if start.lowerBound > frameBuffer.startIndex {
+                    frameBuffer = Data(frameBuffer[start.lowerBound...])
+                }
+                if frameBuffer.count > 2 * 1024 * 1024 { frameBuffer.removeAll() } // runaway guard
+                return
+            }
+            let jpeg = Data(frameBuffer[start.lowerBound..<end.upperBound])
+            frameBuffer = Data(frameBuffer[end.upperBound...])
+            if let image = UIImage(data: jpeg) {
+                latestFrame = image
+                frameCount += 1
+                if frameCount == 1 {
+                    append("First JPEG frame: \(Int(image.size.width))×\(Int(image.size.height)), \(jpeg.count) B")
+                }
+            }
+        }
+    }
+
+    /// Writes the raw capture to a temporary file for sharing.
+    func exportRawCapture() -> URL? {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("contour-rx.bin")
+        do {
+            try rawCapture.write(to: url)
+            return url
+        } catch {
+            append("Export failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    func resetCapture() {
+        rawCapture.removeAll()
+        frameBuffer.removeAll()
+        rxTotalBytes = 0
+        frameCount = 0
+        rxLogLines = 0
+        latestFrame = nil
+        append("Capture reset")
     }
 
     // MARK: - Log
