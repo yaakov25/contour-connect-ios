@@ -6,79 +6,119 @@ struct ContentView: View {
     @EnvironmentObject var monitor: AccessoryMonitor
     @State private var hexInput = ""
     @State private var shareURL: URL?
+    @State private var showDebug = false
 
     var body: some View {
         NavigationStack {
             List {
-                Section("Viewfinder") {
-                    if let frame = monitor.latestFrame {
-                        Image(uiImage: frame)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(maxWidth: .infinity)
-                    } else {
-                        Text("No image yet. Any JPEG frame the camera sends will appear here.")
-                            .foregroundStyle(.secondary)
-                    }
-                    Text("Received: \(monitor.rxTotalBytes) B · frames: \(monitor.frameCount)")
-                        .font(.system(.footnote, design: .monospaced))
-                    if monitor.rxTotalBytes > 0 {
-                        Button("Prepare raw data for sharing") { shareURL = monitor.exportRawCapture() }
-                    }
-                    if let url = shareURL {
-                        ShareLink("Share contour-rx.bin", item: url)
-                    }
-                    Button("Reset capture", role: .destructive) { monitor.resetCapture() }
-                }
-
-                Section("Accessories visible to this app") {
-                    if monitor.accessories.isEmpty {
-                        Text("None. Make sure the camera shows “Connected” in Settings › Bluetooth, then tap Refresh.")
-                            .foregroundStyle(.secondary)
-                    }
-                    ForEach(monitor.accessories, id: \.connectionID) { accessory in
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text(monitor.describe(accessory))
-                                .font(.system(.footnote, design: .monospaced))
-                                .textSelection(.enabled)
-                            ForEach(accessory.protocolStrings, id: \.self) { proto in
-                                Button("Open session: \(proto)") {
-                                    monitor.openSession(accessory: accessory, protocolString: proto)
-                                }
-                                .font(.footnote)
-                            }
+                Section {
+                    ZStack {
+                        Rectangle().fill(Color.black)
+                        if let frame = monitor.latestFrame {
+                            Image(uiImage: frame)
+                                .resizable()
+                                .scaledToFit()
+                        } else {
+                            Text(monitor.sessionProtocol == nil ? "Camera not connected" : "Waiting for preview …")
+                                .foregroundStyle(.white.opacity(0.7))
                         }
                     }
+                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .listRowInsets(EdgeInsets())
+
+                    HStack {
+                        Text(monitor.previewRunning ? "Preview on" : "Preview off")
+                        Spacer()
+                        Text(String(format: "%.1f fps · %d frames", monitor.fps, monitor.frameCount))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.footnote)
+
+                    HStack {
+                        Button(monitor.previewRunning ? "Stop preview" : "Start preview") {
+                            monitor.previewRunning ? monitor.stopPreview() : monitor.startPreview()
+                        }
+                        .buttonStyle(.bordered)
+                        Spacer()
+                        if monitor.status?.isRecording == true {
+                            Button("■ Stop recording", role: .destructive) { monitor.stopRecording() }
+                                .buttonStyle(.borderedProminent)
+                        } else {
+                            Button("● Record") { monitor.startRecording() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                        }
+                    }
+                    .disabled(monitor.sessionProtocol == nil)
                 }
 
-                Section("Actions") {
+                Section("Camera") {
+                    if let s = monitor.status {
+                        LabeledContent("State", value: s.stateText)
+                        if s.isRecording {
+                            LabeledContent("Recording", value: formatDuration(s.elapsedRecordSeconds))
+                        }
+                        LabeledContent("Battery", value: "\(s.batteryPercent) %")
+                        LabeledContent("Storage free", value: formatKB(s.storageRemainingKB) + " of " + formatKB(s.storageCapacityKB))
+                        LabeledContent("Switch position", value: "\(s.switchPosition)")
+                        LabeledContent("GPS HDOP", value: "\(s.gpsHdop)")
+                    } else {
+                        Text(monitor.sessionProtocol == nil
+                             ? "Pair the camera in Settings › Bluetooth, then tap Refresh."
+                             : "Waiting for camera status …")
+                            .foregroundStyle(.secondary)
+                    }
+                    if let fw = monitor.firmware {
+                        LabeledContent("Version bytes", value: fw)
+                    }
                     Button("Refresh") { monitor.refresh() }
-                    Button("Show Bluetooth accessory picker") { monitor.showPicker() }
-                    Button("Copy log") { UIPasteboard.general.string = monitor.logText }
-                    Button("Clear log", role: .destructive) { monitor.clearLog() }
                 }
 
-                if let proto = monitor.sessionProtocol {
-                    Section("Session: \(proto)") {
+                Section {
+                    DisclosureGroup("Debug", isExpanded: $showDebug) {
+                        ForEach(monitor.accessories, id: \.connectionID) { accessory in
+                            Text(monitor.describe(accessory))
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                        Text("Received: \(monitor.rxTotalBytes) B")
+                            .font(.system(.footnote, design: .monospaced))
                         TextField("Hex bytes, e.g. 01 02 ff", text: $hexInput)
                             .font(.system(.body, design: .monospaced))
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
-                        Button("Send") { monitor.sendHex(hexInput) }
-                        Button("Close session", role: .destructive) { monitor.closeSession() }
-                    }
-                }
-
-                Section("Log") {
-                    ForEach(Array(monitor.log.enumerated().reversed()), id: \.offset) { _, line in
-                        Text(line)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
+                        Button("Send raw bytes") { monitor.sendHex(hexInput) }
+                        Button("Request status") { monitor.requestStatus() }
+                        Button("Request settings") { monitor.requestSettings() }
+                        Button("Copy log") { UIPasteboard.general.string = monitor.logText }
+                        if monitor.rxTotalBytes > 0 {
+                            Button("Prepare raw data for sharing") { shareURL = monitor.exportRawCapture() }
+                        }
+                        if let url = shareURL {
+                            ShareLink("Share contour-rx.bin", item: url)
+                        }
+                        Button("Reset capture", role: .destructive) { monitor.resetCapture() }
+                        Button("Clear log", role: .destructive) { monitor.clearLog() }
+                        ForEach(Array(monitor.log.suffix(300).enumerated().reversed()), id: \.offset) { _, line in
+                            Text(line)
+                                .font(.system(.caption2, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
                     }
                 }
             }
             .navigationTitle("Contour")
             .refreshable { monitor.refresh() }
         }
+    }
+
+    private func formatKB(_ kb: UInt32) -> String {
+        let gb = Double(kb) / 1024 / 1024
+        return gb >= 1 ? String(format: "%.1f GB", gb) : String(format: "%.0f MB", Double(kb) / 1024)
+    }
+
+    private func formatDuration(_ seconds: UInt32) -> String {
+        String(format: "%d:%02d", seconds / 60, seconds % 60)
     }
 }

@@ -2,25 +2,39 @@ import Foundation
 import ExternalAccessory
 import UIKit
 
-/// Watches for MFi (iAP) accessories, shows what iOS reports about them,
-/// and can open a raw data session so we can probe the camera's protocol.
+/// Finds the Contour camera (MFi accessory, protocol "com.contour"), opens a session
+/// and speaks the camera protocol: handshake, status polling, live preview, recording.
 final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
     @Published var accessories: [EAAccessory] = []
     @Published var log: [String] = []
     @Published var sessionProtocol: String?
 
-    // Viewfinder: any JPEG found in the incoming byte stream is shown here.
+    // Camera state
+    @Published var firmware: String?
+    @Published var status: ContourProtocol.Status?
+    @Published var previewRunning = false
+
+    // Viewfinder
     @Published var latestFrame: UIImage?
     @Published var frameCount = 0
+    @Published var fps: Double = 0
     @Published var rxTotalBytes = 0
 
     private var session: EASession?
     private var pendingOutput = Data()
-    private var frameBuffer = Data()
+    private var rxBuffer = Data()
+    private var nextPacketID: UInt32 = 0
+    private var statusTimer: Timer?
+    private var fpsWindowStart = Date()
+    private var fpsWindowFrames = 0
+
     /// Everything received in this app run, for export (capped).
     private(set) var rawCapture = Data()
     private let rawCaptureLimit = 20 * 1024 * 1024
     private var rxLogLines = 0
+
+    /// Log every packet in detail (off by default once preview runs, it would flood the log).
+    var verbosePackets = true
 
     let declaredProtocols: [String] =
         Bundle.main.object(forInfoDictionaryKey: "UISupportedExternalAccessoryProtocols") as? [String] ?? []
@@ -45,7 +59,6 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         for accessory in accessories {
             append(describe(accessory))
         }
-        // Open a session automatically so we never miss data the camera sends on its own.
         if session == nil,
            let camera = accessories.first(where: { !$0.protocolStrings.isEmpty }),
            let proto = camera.protocolStrings.first {
@@ -105,15 +118,24 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         }
         session = newSession
         sessionProtocol = protocolString
+        nextPacketID = 0
+        rxBuffer.removeAll()
+        status = nil
+        firmware = nil
+        verbosePackets = true
         for stream in [newSession.inputStream as Stream?, newSession.outputStream as Stream?].compactMap({ $0 }) {
             stream.delegate = self
             stream.schedule(in: .main, forMode: .default)
             stream.open()
         }
         append("Session opened: \(protocolString)")
+        // Handshake: the Android app sends an empty ACK first; the camera then identifies itself.
+        sendRaw(ContourProtocol.ack(packetID: makePacketID()), label: "hello (ACK)")
     }
 
     func closeSession() {
+        statusTimer?.invalidate()
+        statusTimer = nil
         guard let current = session else { return }
         for stream in [current.inputStream as Stream?, current.outputStream as Stream?].compactMap({ $0 }) {
             stream.close()
@@ -122,14 +144,53 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         }
         session = nil
         sessionProtocol = nil
+        previewRunning = false
         pendingOutput.removeAll()
         append("Session closed")
     }
 
-    /// Sends bytes given as hex text, e.g. "01 02 ff".
+    // MARK: - Camera commands
+
+    func startPreview() {
+        sendCommand(.videoStreamOn)
+        previewRunning = true
+    }
+
+    func stopPreview() {
+        sendCommand(.videoStreamOff)
+        previewRunning = false
+    }
+
+    func startRecording() { sendCommand(.recordStart) }
+    func stopRecording() { sendCommand(.recordStop) }
+    func requestStatus() { sendCommand(.getStatus, quiet: true) }
+    func requestSettings() { sendCommand(.getSettings) }
+
+    private func makePacketID() -> UInt32 {
+        nextPacketID &+= 1
+        return nextPacketID
+    }
+
+    private func sendCommand(_ cmd: ContourProtocol.Cmd, data: Data = Data(), quiet: Bool = false) {
+        let packet = ContourProtocol.command(cmd.rawValue, data: data, packetID: makePacketID())
+        sendRaw(packet, label: quiet ? nil : "CMD \(cmd)")
+    }
+
+    private func sendRaw(_ bytes: Data, label: String?) {
+        guard session?.outputStream != nil else {
+            append("No open session")
+            return
+        }
+        pendingOutput.append(bytes)
+        if let label = label {
+            append("TX \(label): \(hex(bytes.prefix(32)))\(bytes.count > 32 ? " …" : "")")
+        }
+        flushOutput()
+    }
+
+    /// Sends bytes given as hex text, e.g. "01 02 ff" (debug).
     func sendHex(_ text: String) {
-        let cleaned = text.replacingOccurrences(of: "0x", with: "")
-            .filter { $0.isHexDigit }
+        let cleaned = text.replacingOccurrences(of: "0x", with: "").filter { $0.isHexDigit }
         guard !cleaned.isEmpty, cleaned.count % 2 == 0 else {
             append("Invalid hex input")
             return
@@ -141,13 +202,7 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
             if let byte = UInt8(cleaned[index..<next], radix: 16) { bytes.append(byte) }
             index = next
         }
-        guard session?.outputStream != nil else {
-            append("No open session")
-            return
-        }
-        pendingOutput.append(bytes)
-        append("TX \(bytes.count) B: \(hex(bytes))")
-        flushOutput()
+        sendRaw(bytes, label: "raw")
     }
 
     private func flushOutput() {
@@ -159,13 +214,15 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         if written > 0 { pendingOutput.removeFirst(written) }
     }
 
+    // MARK: - Stream events
+
     func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
         switch eventCode {
         case .openCompleted:
             append("Stream open (\(aStream is InputStream ? "in" : "out"))")
         case .hasBytesAvailable:
             guard let input = aStream as? InputStream else { return }
-            var buffer = [UInt8](repeating: 0, count: 4096)
+            var buffer = [UInt8](repeating: 0, count: 8192)
             while input.hasBytesAvailable {
                 let count = input.read(&buffer, maxLength: buffer.count)
                 if count <= 0 { break }
@@ -190,50 +247,92 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         if rawCapture.count + chunk.count <= rawCaptureLimit {
             rawCapture.append(chunk)
         }
-        // Log the first 200 chunks in full detail (truncated to 64 bytes), then summarise,
-        // so a video stream doesn't flood the log.
-        rxLogLines += 1
-        if rxLogLines <= 200 {
-            let shown = chunk.prefix(64)
-            let more = chunk.count > 64 ? " …" : ""
-            append("RX \(chunk.count) B: \(hex(shown))\(more)")
-        } else if rxLogLines % 100 == 0 {
-            append("RX total so far: \(rxTotalBytes) B, frames: \(frameCount)")
+        rxBuffer.append(chunk)
+        for packet in ContourProtocol.parse(&rxBuffer) {
+            handlePacket(packet)
         }
-        extractJPEGFrames(from: chunk)
     }
 
-    /// Looks for JPEG start (FF D8) and end (FF D9) markers and shows each complete image.
-    private func extractJPEGFrames(from chunk: Data) {
-        frameBuffer.append(chunk)
-        let soi = Data([0xFF, 0xD8])
-        let eoi = Data([0xFF, 0xD9])
-        while true {
-            guard let start = frameBuffer.range(of: soi) else {
-                // Keep only a trailing 0xFF in case a marker is split across chunks.
-                if let last = frameBuffer.last, last == 0xFF {
-                    frameBuffer = Data([0xFF])
-                } else {
-                    frameBuffer.removeAll()
-                }
-                return
+    private func handlePacket(_ packet: ContourProtocol.Packet) {
+        guard packet.type == ContourProtocol.PacketType.cmd.rawValue, let cmdByte = packet.cmd else {
+            return // ACKs from the camera need no action
+        }
+        // Every command from the camera is acknowledged with its packet ID + 1 (as the Android app does).
+        sendRaw(ContourProtocol.ack(packetID: packet.packetID &+ 1), label: nil)
+
+        let cmd = ContourProtocol.Cmd(rawValue: cmdByte)
+        if verbosePackets && cmd != .jpeg {
+            rxLogLines += 1
+            if rxLogLines <= 300 {
+                append("RX CMD 0x\(String(format: "%02X", cmdByte)) \(cmd.map { "\($0)" } ?? "?") id=\(packet.packetID) data=\(packet.data.count) B \(hex(packet.data.prefix(24)))")
             }
-            guard let end = frameBuffer.range(of: eoi, in: start.upperBound..<frameBuffer.endIndex) else {
-                if start.lowerBound > frameBuffer.startIndex {
-                    frameBuffer = Data(frameBuffer[start.lowerBound...])
-                }
-                if frameBuffer.count > 2 * 1024 * 1024 { frameBuffer.removeAll() } // runaway guard
-                return
+        }
+
+        switch cmd {
+        case .identify:
+            let v = [UInt8](packet.data)
+            firmware = v.map(String.init).joined(separator: ".")
+            append("Camera identified, version bytes: \(firmware ?? "?")")
+            // Same follow-up as the Android app: set clock, then ask for status.
+            sendCommand(.startupUpdate, data: ContourProtocol.startupUpdatePayload())
+            requestStatus()
+            startStatusTimer()
+        case .retStatus, .retStatusNew:
+            let first = status == nil
+            if let s = ContourProtocol.status(from: packet.data) {
+                status = s
             }
-            let jpeg = Data(frameBuffer[start.lowerBound..<end.upperBound])
-            frameBuffer = Data(frameBuffer[end.upperBound...])
-            if let image = UIImage(data: jpeg) {
+            if first {
+                // Android: after the first status, request settings and start the video stream.
+                requestSettings()
+                startPreview()
+            }
+        case .jpeg:
+            if let jpeg = ContourProtocol.jpegData(from: packet), let image = UIImage(data: jpeg) {
                 latestFrame = image
                 frameCount += 1
+                updateFPS()
                 if frameCount == 1 {
-                    append("First JPEG frame: \(Int(image.size.width))×\(Int(image.size.height)), \(jpeg.count) B")
+                    append("First preview frame: \(Int(image.size.width))×\(Int(image.size.height)), \(jpeg.count) B")
                 }
             }
+        case .videoStreamStarted:
+            previewRunning = true
+            append("Preview started")
+        case .videoStreamStopped:
+            previewRunning = false
+            append("Preview stopped")
+        case .recordStarted:
+            append("Recording started")
+            requestStatus()
+        case .recordStopped:
+            append("Recording stopped")
+            requestStatus()
+        case .retSettings:
+            append("Settings received (\(packet.data.count) B)")
+        case .retConfigure:
+            append("Configure state: \(packet.data.first.map(String.init) ?? "?")")
+        case .debugText:
+            append("Camera debug: \(String(decoding: packet.data, as: UTF8.self))")
+        default:
+            break
+        }
+    }
+
+    private func startStatusTimer() {
+        statusTimer?.invalidate()
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            self?.requestStatus()
+        }
+    }
+
+    private func updateFPS() {
+        fpsWindowFrames += 1
+        let elapsed = Date().timeIntervalSince(fpsWindowStart)
+        if elapsed >= 2 {
+            fps = Double(fpsWindowFrames) / elapsed
+            fpsWindowFrames = 0
+            fpsWindowStart = Date()
         }
     }
 
@@ -251,7 +350,6 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
 
     func resetCapture() {
         rawCapture.removeAll()
-        frameBuffer.removeAll()
         rxTotalBytes = 0
         frameCount = 0
         rxLogLines = 0
@@ -270,6 +368,7 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         let entry = "[\(stamp)] \(line)"
         if Thread.isMainThread {
             log.append(entry)
+            if log.count > 2000 { log.removeFirst(log.count - 2000) }
         } else {
             DispatchQueue.main.async { self.log.append(entry) }
         }

@@ -25,7 +25,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: Contour Test
+        CFBundleDisplayName: Contour
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
