@@ -129,8 +129,16 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
             stream.open()
         }
         append("Session opened: \(protocolString)")
-        // Handshake: the Android app sends an empty ACK first; the camera then identifies itself.
-        sendRaw(ContourProtocol.ack(packetID: makePacketID()), label: "hello (ACK)")
+        // Over iOS the camera uses FF AA framing and needs no Android-style hello.
+        // Ask for status; the first status reply triggers settings + preview (as on Android).
+        requestStatus(log: true)
+        startStatusTimer()
+        // Fallback: if the camera does not answer the status request, try the preview anyway.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self = self, self.session != nil, self.status == nil, self.frameCount == 0 else { return }
+            self.append("No status reply yet, requesting preview directly")
+            self.startPreview()
+        }
     }
 
     func closeSession() {
@@ -153,7 +161,6 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
 
     func startPreview() {
         sendCommand(.videoStreamOn)
-        previewRunning = true
     }
 
     func stopPreview() {
@@ -163,7 +170,7 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
 
     func startRecording() { sendCommand(.recordStart) }
     func stopRecording() { sendCommand(.recordStop) }
-    func requestStatus() { sendCommand(.getStatus, quiet: true) }
+    func requestStatus(log: Bool = false) { sendCommand(.getStatus, quiet: !log) }
     func requestSettings() { sendCommand(.getSettings) }
 
     private func makePacketID() -> UInt32 {
@@ -172,7 +179,7 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
     }
 
     private func sendCommand(_ cmd: ContourProtocol.Cmd, data: Data = Data(), quiet: Bool = false) {
-        let packet = ContourProtocol.command(cmd.rawValue, data: data, packetID: makePacketID())
+        let packet = ContourProtocol.iapFrame(cmd.rawValue, data: data)
         sendRaw(packet, label: quiet ? nil : "CMD \(cmd)")
     }
 
@@ -248,23 +255,22 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
             rawCapture.append(chunk)
         }
         rxBuffer.append(chunk)
-        for packet in ContourProtocol.parse(&rxBuffer) {
+        for packet in ContourProtocol.parseIAP(&rxBuffer) {
             handlePacket(packet)
         }
     }
 
     private func handlePacket(_ packet: ContourProtocol.Packet) {
-        guard packet.type == ContourProtocol.PacketType.cmd.rawValue, let cmdByte = packet.cmd else {
-            return // ACKs from the camera need no action
-        }
-        // Every command from the camera is acknowledged with its packet ID + 1 (as the Android app does).
-        sendRaw(ContourProtocol.ack(packetID: packet.packetID &+ 1), label: nil)
+        guard let cmdByte = packet.cmd else { return }
 
         let cmd = ContourProtocol.Cmd(rawValue: cmdByte)
+        if cmd == .jpeg && frameCount == 0 {
+            append("RX first JPEG packet: \(packet.data.count) B, starts \(hex(packet.data.prefix(12)))")
+        }
         if verbosePackets && cmd != .jpeg {
             rxLogLines += 1
             if rxLogLines <= 300 {
-                append("RX CMD 0x\(String(format: "%02X", cmdByte)) \(cmd.map { "\($0)" } ?? "?") id=\(packet.packetID) data=\(packet.data.count) B \(hex(packet.data.prefix(24)))")
+                append("RX CMD 0x\(String(format: "%02X", cmdByte)) \(cmd.map { "\($0)" } ?? "?") data=\(packet.data.count) B \(hex(packet.data.prefix(24)))")
             }
         }
 
@@ -273,10 +279,7 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
             let v = [UInt8](packet.data)
             firmware = v.map(String.init).joined(separator: ".")
             append("Camera identified, version bytes: \(firmware ?? "?")")
-            // Same follow-up as the Android app: set clock, then ask for status.
-            sendCommand(.startupUpdate, data: ContourProtocol.startupUpdatePayload())
-            requestStatus()
-            startStatusTimer()
+            requestStatus(log: true)
         case .retStatus, .retStatusNew:
             let first = status == nil
             if let s = ContourProtocol.status(from: packet.data) {
@@ -290,6 +293,7 @@ final class AccessoryMonitor: NSObject, ObservableObject, StreamDelegate {
         case .jpeg:
             if let jpeg = ContourProtocol.jpegData(from: packet), let image = UIImage(data: jpeg) {
                 latestFrame = image
+                previewRunning = true
                 frameCount += 1
                 updateFPS()
                 if frameCount == 1 {

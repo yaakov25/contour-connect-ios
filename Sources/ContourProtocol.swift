@@ -47,7 +47,58 @@ enum ContourProtocol {
         let data: Data
     }
 
-    // MARK: Encoding
+    // MARK: iOS (iAP) framing
+    //
+    // Observed 2026-10-18 on firmware 2.1.29: over the iOS accessory session the camera does NOT
+    // use the Android header. It sends frames of the form
+    //   FF AA <length UInt16 big endian> <cmd> <data…>
+    // e.g. "ff aa 00 01 92" (record started) and "ff aa 00 01 93" (record stopped).
+    // Command numbers are the same as on Android.
+
+    static let iapSync: [UInt8] = [0xFF, 0xAA]
+
+    static func iapFrame(_ cmd: UInt8, data: Data = Data()) -> Data {
+        let length = UInt16(1 + data.count)
+        var d = Data(iapSync)
+        d.append(UInt8(length >> 8))
+        d.append(UInt8(length & 0xFF))
+        d.append(cmd)
+        d.append(data)
+        return d
+    }
+
+    /// Pulls complete FF AA frames off the front of `buffer`, skipping anything before a sync marker.
+    static func parseIAP(_ buffer: inout Data) -> [Packet] {
+        var packets: [Packet] = []
+        while true {
+            // Find sync
+            guard let syncRange = buffer.range(of: Data(iapSync)) else {
+                // keep a trailing 0xFF in case the marker is split
+                if buffer.last == 0xFF { buffer = Data([0xFF]) } else { buffer.removeAll() }
+                break
+            }
+            if syncRange.lowerBound != buffer.startIndex {
+                buffer = Data(buffer[syncRange.lowerBound...])
+            }
+            guard buffer.count >= 4 else { break }
+            let b = [UInt8](buffer.prefix(4))
+            let length = Int(b[2]) << 8 | Int(b[3])
+            if length == 0 {
+                buffer = Data(buffer.dropFirst(4))
+                continue
+            }
+            let total = 4 + length
+            guard buffer.count >= total else { break }
+            let start = buffer.startIndex
+            let cmd = buffer[start + 4]
+            let data = total > 5 ? Data(buffer[(start + 5)..<(start + total)]) : Data()
+            packets.append(Packet(type: PacketType.cmd.rawValue, packetID: 0, cmd: cmd, data: data))
+            buffer = Data(buffer.dropFirst(total))
+        }
+        return packets
+    }
+
+    // MARK: Android framing (kept for reference; not used by the camera over iOS)
 
     static func ack(packetID: UInt32) -> Data {
         var d = Data()
@@ -125,10 +176,12 @@ enum ContourProtocol {
         return packets
     }
 
-    /// JPEG packets carry 3 bytes before the image.
+    /// JPEG packets carry a few bytes before the image (3 on Android); locate the JPEG start marker
+    /// rather than assuming a fixed offset, in case iOS framing differs.
     static func jpegData(from packet: Packet) -> Data? {
-        guard packet.data.count > 3 else { return nil }
-        return Data(packet.data.dropFirst(3))
+        let d = packet.data
+        guard let soi = d.range(of: Data([0xFF, 0xD8])) else { return nil }
+        return Data(d[soi.lowerBound...])
     }
 
     struct Status {
