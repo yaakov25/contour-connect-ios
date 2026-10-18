@@ -187,8 +187,8 @@ enum ContourProtocol {
     struct Status {
         let gpsHdop: UInt8
         let batteryPercent: UInt8
-        let storageCapacityKB: UInt32
-        let storageRemainingKB: UInt32
+        let storageCapacityKB: UInt32   // reported in MB on the Contour+2
+        let storageRemainingKB: UInt32  // reported in MB on the Contour+2
         let cameraState: UInt32     // 0 preview paused, 1 preview, 2 recording, 3 recording stopped
         let elapsedRecordSeconds: UInt32
         let switchPosition: UInt8

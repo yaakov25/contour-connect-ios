@@ -3,9 +3,19 @@
 A personal iOS app to control a Contour+2 action camera (model 1700) over Bluetooth.
 The original Contour Connect app is no longer available.
 
-**Current stage: protocol discovery.** Confirmed: the camera appears as accessory "Connect View" (Contour+2, firmware 2.1.29) with protocol string `com.contour`, and an EASession opens. The app lists the Bluetooth accessories iOS
-makes visible to it, shows what the camera reports (manufacturer, model, firmware,
-protocol strings), and can open a raw data session to probe the camera's commands.
+**Status: working.** Live preview (432×240 JPEG, ~3 fps), camera status (battery, storage, state,
+switch position) and record start/stop all work on a Contour+2 with firmware 2.1.29.
+
+## Protocol notes
+
+- MFi accessory "Connect View", protocol string `com.contour` (ExternalAccessory framework).
+- Over iOS the camera frames messages as `FF AA <length UInt16 BE> <cmd> <data…>`
+  (the Android app's 11-byte header is not used here).
+- Command numbers match the Android app: `0x01` preview on, `0x03` preview off, `0x04` JPEG frame
+  (3 bytes, then JPEG), `0x05`/`0x06` preview started/stopped, `0x55` get settings → `0x58`,
+  `0x75` get status → `0x76`, `0x90`/`0x91` record start/stop → `0x92`/`0x93`.
+- Status payload (19 B, big endian): HDOP, battery %, capacity MB (u32), free MB (u32),
+  state (u32: 0 paused, 1 preview, 2 recording, 3 stopped), seconds (u32), switch position.
 
 ## Build
 

@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var hexInput = ""
     @State private var shareURL: URL?
     @State private var showDebug = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationStack {
@@ -110,12 +111,17 @@ struct ContentView: View {
             }
             .navigationTitle("Contour")
             .refreshable { monitor.refresh() }
+            // iOS closes the accessory session when the app goes to the background; reconnect on return.
+            .onChange(of: scenePhase) { phase in
+                if phase == .active { monitor.refresh() }
+            }
         }
     }
 
-    private func formatKB(_ kb: UInt32) -> String {
-        let gb = Double(kb) / 1024 / 1024
-        return gb >= 1 ? String(format: "%.1f GB", gb) : String(format: "%.0f MB", Double(kb) / 1024)
+    /// The camera reports storage in MB (a 32 GB card shows ~29838).
+    private func formatKB(_ mb: UInt32) -> String {
+        let gb = Double(mb) / 1024
+        return gb >= 1 ? String(format: "%.1f GB", gb) : "\(mb) MB"
     }
 
     private func formatDuration(_ seconds: UInt32) -> String {
