@@ -3,7 +3,7 @@
 A personal iOS app to control a Contour+2 action camera (model 1700) over Bluetooth.
 The original Contour Connect app is no longer available.
 
-**Current stage: compatibility test.** The app lists the Bluetooth accessories iOS
+**Current stage: protocol discovery.** Confirmed: the camera appears as accessory "Connect View" (Contour+2, firmware 2.1.29) with protocol string `com.contour`, and an EASession opens. The app lists the Bluetooth accessories iOS
 makes visible to it, shows what the camera reports (manufacturer, model, firmware,
 protocol strings), and can open a raw data session to probe the camera's commands.
 
